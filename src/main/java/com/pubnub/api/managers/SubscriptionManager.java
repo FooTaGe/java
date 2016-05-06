@@ -17,10 +17,12 @@ import com.pubnub.api.enums.PNHeartbeatNotificationOptions;
 import com.pubnub.api.enums.PNOperationType;
 import com.pubnub.api.enums.PNStatusCategory;
 import com.pubnub.api.models.SubscriptionItem;
+import com.pubnub.api.models.consumer.PNErrorData;
 import com.pubnub.api.models.consumer.PNStatus;
 import com.pubnub.api.models.consumer.pubsub.PNMessageResult;
 import com.pubnub.api.models.consumer.pubsub.PNPresenceEventResult;
 import com.pubnub.api.models.server.Envelope;
+import com.pubnub.api.models.server.PresenceEnvelope;
 import com.pubnub.api.models.server.SubscribeEnvelope;
 import com.pubnub.api.models.server.SubscribeMessage;
 import lombok.extern.slf4j.Slf4j;
@@ -65,7 +67,13 @@ public class SubscriptionManager {
      */
     private String region;
 
-    Timer timer;
+    /**
+     * Timer for heartbeat operations.
+     */
+    private Timer timer;
+
+    private ObjectMapper mapper;
+
 
     public SubscriptionManager(PubNub pubnub) {
         this.subscribedChannelGroups = new HashMap<>();
@@ -74,9 +82,11 @@ public class SubscriptionManager {
         this.subscribedChannels = new HashMap<>();
         this.subscribedPresenceChannels = new HashMap<>();
 
-
         this.pubnub = pubnub;
         this.listeners = new ArrayList<>();
+
+        this.mapper = new ObjectMapper();
+
     }
 
 
@@ -258,7 +268,7 @@ public class SubscriptionManager {
                 .filterExpression(pubnub.getConfiguration().getFilterExpression())
                 .async(new PNCallback<SubscribeEnvelope>() {
                     @Override
-                    public void onResponse(SubscribeEnvelope result, PNStatus status) {
+                    public void onResponse(final SubscribeEnvelope result, final PNStatus status) {
                         if (status.isError()) {
 
                             if (status.getCategory() == PNStatusCategory.PNTimeoutCategory) {
@@ -336,16 +346,16 @@ public class SubscriptionManager {
             }
 
             if (message.getChannel().contains("-pnpres")) {
-                Map<String, Object> presencePayload = (Map<String, Object>) message.getPayload();
-
+                PresenceEnvelope presencePayload = mapper.convertValue(message.getPayload(), PresenceEnvelope.class);
+                
                 PNPresenceEventResult pnPresenceEventResult = PNPresenceEventResult.builder()
-                        .event(presencePayload.get("action").toString())
+                        .event(presencePayload.getAction())
                         .actualChannel((subscriptionMatch != null) ? channel : null)
                         .subscribedChannel(subscriptionMatch != null ? subscriptionMatch : channel)
                         .timetoken(timetoken)
-                        .occupancy((int) presencePayload.get("occupancy"))
-                        .uuid(presencePayload.get("uuid").toString())
-                        .timestamp(Long.valueOf(presencePayload.get("timestamp").toString()))
+                        .occupancy(presencePayload.getOccupancy())
+                        .uuid(presencePayload.getUuid())
+                        .timestamp(presencePayload.getTimestamp())
                         .build();
 
                 announce(pnPresenceEventResult);
@@ -356,8 +366,9 @@ public class SubscriptionManager {
                     extractedMessage = processMessage(message.getPayload());
                 } catch (PubNubException e) {
                     PNStatus pnStatus = PNStatus.builder().error(true)
+                            .errorData(new PNErrorData(e.getMessage(), e))
                             .operation(PNOperationType.PNSubscribeOperation)
-                            .category(PNStatusCategory.PNDecryptionErrorCategory)
+                            .category(PNStatusCategory.PNUnknownCategory)
                             .build();
 
                     announce(pnStatus);
@@ -377,16 +388,21 @@ public class SubscriptionManager {
         }
     }
 
-    private Object processMessage(Object input) throws PubNubException {
+    private Object processMessage(final Object input) throws PubNubException {
         if (pubnub.getConfiguration().getCipherKey() == null) {
             return input;
         }
 
         Crypto crypto = new Crypto(pubnub.getConfiguration().getCipherKey());
-        String outputText = crypto.decrypt(input.toString());
-
-        ObjectMapper mapper = new ObjectMapper();
+        String outputText;
         Object outputObject;
+
+        try {
+            outputText = crypto.decrypt(input.toString());
+        } catch (PubNubException e) {
+            throw PubNubException.builder().pubnubError(PubNubErrorBuilder.PNERROBJ_CRYPTO_ERROR).errormsg(e.getMessage()).build();
+        }
+
         try {
             outputObject = mapper.readValue(outputText, JsonNode.class);
         } catch (IOException e) {
